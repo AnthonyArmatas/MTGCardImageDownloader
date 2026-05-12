@@ -1,0 +1,110 @@
+# =========================
+# Build output
+# =========================
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+# =========================
+# Visual Studio
+# =========================
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Visual Studio cache/files
+*.cache
+*.pdb
+*.opendb
+*.VC.db
+
+# =========================
+# Rider / JetBrains
+# =========================
+.idea/
+*.sln.iml
+
+# =========================
+# ASP.NET / Blazor
+# =========================
+wwwroot/dist/
+wwwroot/build/
+wwwroot/lib/
+
+# Generated static web assets
+**/staticwebassets/
+staticwebassets.build.json
+staticwebassets.development.json
+staticwebassets.pack.json
+
+# Scss generated files
+*.bundle.scp.css
+*.rz.scp.css
+
+# =========================
+# Node / JS
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =========================
+# NuGet
+# =========================
+*.nupkg
+*.snupkg
+packages/
+.nuget/
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+appsettings.Local.json
+
+# Keep appsettings but ignore secrets override
+# !appsettings.json
+# !appsettings.Development.json
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+~$*
+
+# =========================
+# Project evaluation/cache artifacts
+# =========================
+ProjectEvaluation/
+*.metadata.v8.bin
+*.projects.v8.bin
+*.strings.v8.bin
+*.vsidx
+*.futdcache.v2
+
+# =========================
+# Generated Razor/component files
+# =========================
+*.GeneratedMSBuildEditorConfig.editorconfig
+*.AssemblyInfo.cs
+*.AssemblyAttributes.cs
+*.GlobalUsings.g.cs

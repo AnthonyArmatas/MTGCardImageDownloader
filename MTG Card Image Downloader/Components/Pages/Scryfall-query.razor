@@ -1,0 +1,211 @@
+﻿@page "/scryfall-query"
+@rendermode InteractiveServer
+@inject IHttpClientFactory HttpClientFactory
+
+@using System.Text.Json
+@using System.Text.RegularExpressions
+@using System.IO
+@using System;
+@* @using Photoshop; *@
+@* @using Interop.Photoshop; *@
+
+<h3>Scryfall PNG Downloader (single + double-faced)</h3>
+
+<textarea @bind="InputText"
+          rows="6"
+          cols="80"
+          placeholder="e.g. 1 Asceticism (PLST) SOM-110 …"></textarea>
+<br />
+<button class="btn btn-primary" @onclick="ProcessInput">Download PNGs</button>
+
+@* <button class="btn btn-primary" @onclick="ProcessImagesToPng">Export PNG sheet</button> *@
+
+
+@if (Messages.Any())
+{
+    <ul class="mt-3">
+        @foreach (var m in Messages)
+        {
+            <li>@m</li>
+        }
+    </ul>
+}
+
+@code {
+    private string InputText { get; set; } = "";
+    private List<string> Messages { get; set; } = new();
+
+    // Hard-coded download folder
+    private readonly string DownloadFolder = Path.Combine(
+        Directory.GetCurrentDirectory(), "wwwroot", "downloaded-pngs"
+    );
+
+    private async Task ProcessInput()
+    {
+        Messages.Clear();
+        Directory.CreateDirectory(DownloadFolder);
+        Messages.Add($"➡️ Saving to {DownloadFolder}");
+
+        var client = HttpClientFactory.CreateClient("ExternalScryfall");
+        var lines = InputText
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var line in lines)
+        {
+            // capture SET in () and collector # (including dashes, letters, etc.)
+            var m = Regex.Match(line, @"\((\w+)\)\s*([^\s#]+)");
+            if (!m.Success)
+            {
+                Messages.Add($"❓ Skipping unparseable: “{line}”");
+                continue;
+            }
+
+            var setCode = m.Groups[1].Value;        // e.g. "PLST" or "ZNR"
+            var collectorNum = m.Groups[2].Value;        // e.g. "SOM-110" or "261"
+            var endpoint = $"https://api.scryfall.com/cards/{setCode}/{collectorNum}";
+
+            try
+            {
+                // 1) Fetch JSON with headers
+                var jsonReq = new HttpRequestMessage(HttpMethod.Get, endpoint);
+                jsonReq.Headers.UserAgent.ParseAdd("MTGCardImageDownloader/1.0");
+                jsonReq.Headers.Accept.ParseAdd("application/json");
+                var jsonResp = await client.SendAsync(jsonReq);
+                jsonResp.EnsureSuccessStatusCode();
+
+                var json = await jsonResp.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                // 2) Decide single-face vs double-face
+                if (root.TryGetProperty("image_uris", out var rootImgs))
+                {
+                    // single-face
+                    await DownloadAndSave(rootImgs.GetProperty("png").GetString()!,
+                                          $"{setCode}_{collectorNum}.png",
+                                          client);
+                }
+                else if (root.TryGetProperty("card_faces", out var faces) &&
+                         faces.ValueKind == JsonValueKind.Array)
+                {
+                    // double-faced: loop each face
+                    foreach (var face in faces.EnumerateArray())
+                    {
+                        var faceName = face.GetProperty("name").GetString()!;
+                        // sanitize to filename safe (remove spaces/slashes/etc.)
+                        var safeFace = Regex.Replace(faceName, @"\W+", "");
+                        var imgs = face.GetProperty("image_uris");
+                        var pngUrl = imgs.GetProperty("png").GetString();
+                        if (string.IsNullOrEmpty(pngUrl))
+                        {
+                            Messages.Add($"⚠️ No PNG URL for face {faceName}");
+                            continue;
+                        }
+
+                        await DownloadAndSave(pngUrl,
+                                              $"{setCode}_{collectorNum}_{safeFace}.png",
+                                              client);
+                    }
+                }
+                else
+                {
+                    Messages.Add($"⚠️ No image_uris or card_faces for {setCode}/{collectorNum}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Messages.Add($"❌ [{setCode}/{collectorNum}] {ex.Message}");
+            }
+        }
+    }
+
+    // private async Task ProcessImagesToPng()
+    // {
+    //     try
+    //     {
+    //         string folderPath = @"D:\MTG Stuff\Decks\InProgress\Ruric Thar\Printings\1";
+    //         string outputPath = Path.Combine(folderPath, "exported_result.png");
+
+    //         string[] imageFiles = Directory.GetFiles(folderPath, "*.png");
+
+    //         if (imageFiles.Length != 9)
+    //         {
+    //             Console.WriteLine("You must have exactly 9 PNGs in the folder.");
+    //             return;
+    //         }
+
+    //         var app = new Photoshop.Application();
+    //         app.DisplayDialogs = PsDialogModes.psDisplayNoDialogs;
+
+    //         const int cardWidth = 770;   // width of each card
+    //         const int cardHeight = 1070;  // height of each card
+    //         const int margin = 20;       // margin between cards
+
+    //         int columns = 3;
+    //         int rows = 3;
+
+    //         int canvasWidth = columns * cardWidth + (columns + 1) * margin;
+    //         int canvasHeight = rows * cardHeight + (rows + 1) * margin;
+
+    //         // Create new document
+    //         var doc = app.Documents.Add(
+    //             canvasWidth,
+    //             canvasHeight,
+    //             72,
+    //             "CardSheet",
+    //             PsNewDocumentMode.psNewRGB,
+    //             PsDocumentFill.psWhite
+    //         );
+
+    //         for (int i = 0; i < imageFiles.Length; i++)
+    //         {
+    //             string imgPath = imageFiles[i];
+    //             var tempDoc = app.Open(imgPath);
+
+    //             tempDoc.Selection.SelectAll();
+    //             tempDoc.Selection.Copy();
+    //             tempDoc.Close(PsSaveOptions.psDoNotSaveChanges);
+
+    //             doc.Paste();
+    //             var layer = doc.ActiveLayer;
+
+    //             int row = i / columns;
+    //             int col = i % columns;
+
+    //             int x = margin + col * (cardWidth + margin);
+    //             int y = margin + row * (cardHeight + margin);
+
+    //             layer.Translate(x - layer.Bounds[0].Value, y - layer.Bounds[1].Value);
+    //         }
+
+    //         // Export as PNG
+    //         var options = new PNGSaveOptions();
+    //         doc.SaveAs(outputPath, options, true, PsExtensionType.psLowercase);
+    //         doc.Close(PsSaveOptions.psDoNotSaveChanges);
+
+    //         Console.WriteLine("Exported to " + outputPath);
+    //     }
+    //     catch (Exception ex)
+    //     {
+    //         Console.WriteLine(ex.Message);
+    //     }
+        
+    // }
+
+    /// <summary>
+    /// Helper to GET a PNG URL (with User-Agent) and write it to disk.
+    /// </summary>
+    private async Task DownloadAndSave(string pngUrl, string fileName, HttpClient client)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Get, pngUrl);
+        req.Headers.UserAgent.ParseAdd("MTGCardImageDownloader/1.0");
+        var resp = await client.SendAsync(req);
+        resp.EnsureSuccessStatusCode();
+
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        var savePath = Path.Combine(DownloadFolder, fileName);
+        await File.WriteAllBytesAsync(savePath, bytes);
+
+        Messages.Add($"✅ Saved {fileName}");
+    }
+}
