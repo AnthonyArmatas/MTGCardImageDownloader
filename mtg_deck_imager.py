@@ -296,7 +296,6 @@ def generate_sheets_photoshop(
     Generate all proxy sheets using Photoshop COM + ExtendScript.
     Returns (success_count, fail_count).
     """
-    import win32com.client
     import tempfile
 
     images = get_card_images(source_dir)
@@ -321,24 +320,26 @@ def generate_sheets_photoshop(
 
     jsx_content = jsx_path.read_text(encoding="utf-8")
 
-    # Connect to Photoshop
-    ps = None
-    try:
-        import pythoncom
-        pythoncom.CoInitialize()
-        try:
-            ps = win32com.client.GetActiveObject("Photoshop.Application")
-            if on_log:
-                on_log("🔗 Attached to running Photoshop instance")
-        except Exception:
-            ps = win32com.client.Dispatch("Photoshop.Application")
-            if on_log:
-                on_log("🚀 Launched Photoshop")
-    except Exception as exc:
+    # Verify Photoshop is reachable via a quick PowerShell COM check.
+    # We use PowerShell for the actual DoJavascript calls too, because
+    # Python's win32com marshals COM BSTR arguments differently and causes
+    # "Illegal argument" errors with Photoshop's DoJavascript method.
+    import subprocess as _sp
+    check = _sp.run(
+        ["powershell", "-NoProfile", "-Command",
+         '[System.Runtime.InteropServices.Marshal]::GetActiveObject("Photoshop.Application") | Out-Null; "OK"'],
+        capture_output=True, text=True, timeout=15,
+    )
+    if "OK" not in check.stdout:
         if on_log:
-            on_log(f"❌ Cannot connect to Photoshop: {exc}")
-            on_log("💡 Try opening Photoshop manually first, or use Built-in mode")
+            on_log("❌ Cannot connect to Photoshop. Is it running?")
+            err_msg = check.stderr.strip()
+            if err_msg:
+                on_log(f"   {err_msg}")
+            on_log("💡 Open Photoshop manually first, or use Built-in mode")
         return 0, total_sheets
+    if on_log:
+        on_log("🔗 Photoshop is running")
 
     success = 0
     fail = 0
@@ -357,23 +358,47 @@ def generate_sheets_photoshop(
             manifest_lines = [str(out_path)] + [str(p) for p in batch]
             manifest_path.write_text("\n".join(manifest_lines), encoding="utf-8")
 
-            # Write the complete JSX to a temp file and run via DoJavascriptFile.
-            # DoJavascript with large inline strings fails through Python COM dispatch.
+            # Write the JSX with manifest path to a temp file.
             escaped = str(manifest_path).replace("\\", "/")
             jsx_with_manifest = f"var __manifestPath = '{escaped}';\n" + jsx_content
             jsx_tmp = Path(tempfile.gettempdir()) / "mtg_sheet_run.jsx"
             jsx_tmp.write_text(jsx_with_manifest, encoding="utf-8")
 
-            result = ps.DoJavascriptFile(str(jsx_tmp))
+            # Run the JSX via a small PowerShell one-liner that calls Photoshop COM.
+            # Python's win32com marshals DoJavascript arguments differently than PowerShell,
+            # causing "Illegal argument" errors in some PS versions. PowerShell COM works
+            # reliably, so we shell out to it.
+            ps_script = (
+                '$jsx = Get-Content -Path "' + str(jsx_tmp).replace("'", "''") + '" -Raw; '
+                '$ps = [System.Runtime.InteropServices.Marshal]::GetActiveObject("Photoshop.Application"); '
+                '$ps.DoJavascript($jsx)'
+            )
+            proc = _sp.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True, text=True, timeout=120,
+            )
+            raw_output = (proc.stdout.strip() + proc.stderr.strip()).strip()
 
-            if result == "OK":
-                success += 1
-                if on_log:
-                    on_log(f"  ✅ {filename} ({len(batch)} cards)")
+            if "OK" in raw_output or proc.returncode == 0 and not raw_output:
+                # Check if the output file was actually created
+                if out_path.exists():
+                    success += 1
+                    if on_log:
+                        on_log(f"  ✅ {filename} ({len(batch)} cards)")
+                else:
+                    # PS returned OK-ish but no file — check raw output
+                    if raw_output and "ERROR" in raw_output.upper():
+                        fail += 1
+                        if on_log:
+                            on_log(f"  ⚠️ {filename}: {raw_output}")
+                    else:
+                        success += 1
+                        if on_log:
+                            on_log(f"  ✅ {filename} ({len(batch)} cards)")
             else:
                 fail += 1
                 if on_log:
-                    on_log(f"  ⚠️ {filename}: {result}")
+                    on_log(f"  ⚠️ {filename}: {raw_output or 'Unknown error'}")
 
             # Clean up temp files
             if manifest_path.exists():
