@@ -3,7 +3,7 @@ MTG Deck Imager — Scryfall card image downloader with a modern GUI.
 
 Paste a decklist, pick a folder, and download high-res PNGs from Scryfall.
 Supports single-face and double-face cards, multiple decklist formats,
-image previews, and progress tracking.
+image previews, progress tracking, and proxy sheet generation.
 """
 
 import customtkinter as ctk
@@ -13,7 +13,9 @@ import requests
 import threading
 import re
 import os
+import sys
 import io
+import math
 import time
 from pathlib import Path
 
@@ -159,6 +161,231 @@ def download_image(session: requests.Session, url: str, dest: Path) -> bool:
     return False
 
 
+# ── Proxy Sheet Generation ────────────────────────────────────────────────────
+
+# Sheet layout constants — identical to the original MTGProxySheets
+SHEET_WIDTH = 2550       # 8.5" at 300 DPI
+SHEET_HEIGHT = 3300      # 11" at 300 DPI
+SHEET_DPI = 300
+CARD_WIDTH = 770         # pixels
+CARD_HEIGHT = 1070       # pixels
+COL_CENTERS = [432, 1288, 2125]
+ROW_CENTERS = [565, 1655, 2747]
+CARDS_PER_SHEET = 9
+
+# Pre-compute grid positions (top-left corner for each slot)
+GRID_POSITIONS = []
+for _r in ROW_CENTERS:
+    for _c in COL_CENTERS:
+        GRID_POSITIONS.append((_c - CARD_WIDTH // 2, _r - CARD_HEIGHT // 2))
+
+SUPPORTED_IMG_EXTS = {".png", ".jpg", ".jpeg"}
+
+
+def get_card_images(folder: Path) -> list[Path]:
+    """Get sorted list of card image files from a folder."""
+    images = [
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_IMG_EXTS
+    ]
+    images.sort(key=lambda p: p.name.lower())
+    return images
+
+
+def generate_sheet_pillow(
+    image_paths: list[Path],
+    output_path: Path,
+    on_log=None,
+) -> bool:
+    """
+    Generate a single 3x3 proxy sheet using Pillow (no Photoshop needed).
+    Returns True on success.
+    """
+    try:
+        sheet = Image.new("RGB", (SHEET_WIDTH, SHEET_HEIGHT), "white")
+
+        for idx, img_path in enumerate(image_paths[:CARDS_PER_SHEET]):
+            card = Image.open(img_path)
+            card = card.resize((CARD_WIDTH, CARD_HEIGHT), Image.LANCZOS)
+            x, y = GRID_POSITIONS[idx]
+            sheet.paste(card, (x, y))
+            card.close()
+
+        sheet.save(str(output_path), "PNG", dpi=(SHEET_DPI, SHEET_DPI))
+        sheet.close()
+        return True
+    except Exception as exc:
+        if on_log:
+            on_log(f"❌ Pillow error: {exc}")
+        return False
+
+
+def generate_sheets_pillow(
+    source_dir: Path,
+    output_dir: Path,
+    on_log=None,
+    on_progress=None,
+) -> tuple[int, int]:
+    """
+    Generate all proxy sheets from a folder of card images using Pillow.
+    Returns (success_count, fail_count).
+    """
+    images = get_card_images(source_dir)
+    if not images:
+        if on_log:
+            on_log("❌ No image files found (.png, .jpg, .jpeg)")
+        return 0, 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total_sheets = math.ceil(len(images) / CARDS_PER_SHEET)
+
+    if on_log:
+        on_log(f"📋 Found {len(images)} card image(s)")
+        on_log(f"📄 Creating {total_sheets} sheet(s)…")
+
+    success = 0
+    fail = 0
+
+    for i in range(total_sheets):
+        batch = images[i * CARDS_PER_SHEET : (i + 1) * CARDS_PER_SHEET]
+        filename = f"Sheet_{i + 1:03d}.png"
+        out_path = output_dir / filename
+
+        if on_log:
+            on_log(f"  Processing sheet {i + 1}/{total_sheets}…")
+
+        ok = generate_sheet_pillow(batch, out_path, on_log)
+        if ok:
+            success += 1
+            if on_log:
+                on_log(f"  ✅ {filename} ({len(batch)} cards)")
+        else:
+            fail += 1
+
+        if on_progress:
+            on_progress((i + 1) / total_sheets)
+
+    return success, fail
+
+
+def check_photoshop_available() -> bool:
+    """Check if Photoshop COM automation is available."""
+    try:
+        import win32com.client
+        return True
+    except ImportError:
+        return False
+
+
+def get_jsx_path() -> Path:
+    """Get path to CreateSheet.jsx, handling both source and PyInstaller bundle."""
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        return Path(sys._MEIPASS) / "CreateSheet.jsx"
+    else:
+        return Path(__file__).parent / "CreateSheet.jsx"
+
+
+def generate_sheets_photoshop(
+    source_dir: Path,
+    output_dir: Path,
+    on_log=None,
+    on_progress=None,
+) -> tuple[int, int]:
+    """
+    Generate all proxy sheets using Photoshop COM + ExtendScript.
+    Returns (success_count, fail_count).
+    """
+    import win32com.client
+    import tempfile
+
+    images = get_card_images(source_dir)
+    if not images:
+        if on_log:
+            on_log("❌ No image files found (.png, .jpg, .jpeg)")
+        return 0, 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total_sheets = math.ceil(len(images) / CARDS_PER_SHEET)
+
+    if on_log:
+        on_log(f"📋 Found {len(images)} card image(s)")
+        on_log(f"📄 Creating {total_sheets} sheet(s) via Photoshop…")
+
+    # Read JSX content
+    jsx_path = get_jsx_path()
+    if not jsx_path.exists():
+        if on_log:
+            on_log(f"❌ CreateSheet.jsx not found at {jsx_path}")
+        return 0, total_sheets
+
+    jsx_content = jsx_path.read_text(encoding="utf-8")
+
+    # Connect to Photoshop
+    ps = None
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            ps = win32com.client.GetActiveObject("Photoshop.Application")
+            if on_log:
+                on_log("🔗 Attached to running Photoshop instance")
+        except Exception:
+            ps = win32com.client.Dispatch("Photoshop.Application")
+            if on_log:
+                on_log("🚀 Launched Photoshop")
+    except Exception as exc:
+        if on_log:
+            on_log(f"❌ Cannot connect to Photoshop: {exc}")
+            on_log("💡 Try opening Photoshop manually first, or use Built-in mode")
+        return 0, total_sheets
+
+    success = 0
+    fail = 0
+
+    for i in range(total_sheets):
+        batch = images[i * CARDS_PER_SHEET : (i + 1) * CARDS_PER_SHEET]
+        filename = f"Sheet_{i + 1:03d}.png"
+        out_path = output_dir / filename
+
+        if on_log:
+            on_log(f"  Processing sheet {i + 1}/{total_sheets}…")
+
+        try:
+            # Write manifest file (same format as original)
+            manifest_path = Path(tempfile.gettempdir()) / "mtg_manifest.txt"
+            manifest_lines = [str(out_path)] + [str(p) for p in batch]
+            manifest_path.write_text("\n".join(manifest_lines), encoding="utf-8")
+
+            # Inject manifest path and run JSX
+            escaped = str(manifest_path).replace("\\", "/")
+            jsx_with_manifest = f"var __manifestPath = '{escaped}';\n" + jsx_content
+            result = ps.DoJavascript(jsx_with_manifest)
+
+            if result == "OK":
+                success += 1
+                if on_log:
+                    on_log(f"  ✅ {filename} ({len(batch)} cards)")
+            else:
+                fail += 1
+                if on_log:
+                    on_log(f"  ⚠️ {filename}: {result}")
+
+            # Clean up manifest
+            if manifest_path.exists():
+                manifest_path.unlink()
+
+        except Exception as exc:
+            fail += 1
+            if on_log:
+                on_log(f"  ❌ {filename}: {exc}")
+
+        if on_progress:
+            on_progress((i + 1) / total_sheets)
+
+    return success, fail
+
+
 # ── GUI Application ───────────────────────────────────────────────────────────
 
 # Theme
@@ -181,14 +408,19 @@ class MTGDeckImager(ctk.CTk):
         super().__init__()
 
         self.title("MTG Deck Imager")
-        self.geometry("1100x780")
-        self.minsize(900, 650)
+        self.geometry("1100x820")
+        self.minsize(900, 700)
         self.configure(fg_color=BG_DARK)
 
         # State
         self.download_dir: str | None = None
+        self.sheets_source_dir: str | None = None
+        self.sheets_output_dir: str | None = None
         self.is_downloading = False
+        self.is_generating_sheets = False
         self.thumbnail_refs: list = []  # prevent GC of PhotoImage refs
+        self.sheet_thumb_refs: list = []
+        self.ps_available = check_photoshop_available()
 
         self._build_ui()
 
@@ -205,7 +437,7 @@ class MTGDeckImager(ctk.CTk):
             text_color=ACCENT,
         ).pack(side="left", padx=20)
         ctk.CTkLabel(
-            banner, text="Download card art from Scryfall",
+            banner, text="Download card art from Scryfall  ·  Generate proxy sheets",
             font=ctk.CTkFont(size=13),
             text_color="#8899aa",
         ).pack(side="left", padx=8)
@@ -224,9 +456,25 @@ class MTGDeckImager(ctk.CTk):
         left = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
+        # Left-side tabview: Download | Sheets
+        self.left_tabs = ctk.CTkTabview(
+            left, fg_color=BG_CARD, segmented_button_fg_color="#0f1626",
+            segmented_button_selected_color=ACCENT,
+            segmented_button_unselected_color="#1e2d4a",
+            corner_radius=8,
+        )
+        self.left_tabs.pack(fill="both", expand=True, padx=8, pady=8)
+
+        dl_tab = self.left_tabs.add("⬇ Download")
+        sheets_tab = self.left_tabs.add("📄 Proxy Sheets")
+
+        self._build_download_tab(dl_tab)
+        self._build_sheets_tab(sheets_tab)
+
+    def _build_download_tab(self, tab):
         # ── Directory picker ──────────────────────────────────────────────
-        dir_frame = ctk.CTkFrame(left, fg_color="transparent")
-        dir_frame.pack(fill="x", padx=16, pady=(16, 8))
+        dir_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        dir_frame.pack(fill="x", padx=8, pady=(8, 4))
 
         ctk.CTkLabel(
             dir_frame, text="Save Location",
@@ -255,19 +503,19 @@ class MTGDeckImager(ctk.CTk):
 
         # ── Decklist input ────────────────────────────────────────────────
         ctk.CTkLabel(
-            left, text="Decklist",
+            tab, text="Decklist",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=TEXT_LIGHT,
-        ).pack(anchor="w", padx=16, pady=(12, 4))
+        ).pack(anchor="w", padx=8, pady=(8, 4))
 
         self.decklist_box = ctk.CTkTextbox(
-            left, height=220, fg_color="#0f1626",
+            tab, height=220, fg_color="#0f1626",
             text_color=TEXT_LIGHT,
             font=ctk.CTkFont(family="Consolas", size=13),
             corner_radius=8,
             border_width=1, border_color="#2a3a5a",
         )
-        self.decklist_box.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        self.decklist_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.decklist_box.insert(
             "1.0",
             "# Paste your decklist here\n"
@@ -278,8 +526,8 @@ class MTGDeckImager(ctk.CTk):
         )
 
         # ── Controls row ──────────────────────────────────────────────────
-        ctrl = ctk.CTkFrame(left, fg_color="transparent")
-        ctrl.pack(fill="x", padx=16, pady=(0, 12))
+        ctrl = ctk.CTkFrame(tab, fg_color="transparent")
+        ctrl.pack(fill="x", padx=8, pady=(0, 8))
 
         self.download_btn = ctk.CTkButton(
             ctrl, text="⬇  Download Cards", height=40,
@@ -298,24 +546,166 @@ class MTGDeckImager(ctk.CTk):
 
         # ── Progress bar ──────────────────────────────────────────────────
         self.progress = ctk.CTkProgressBar(
-            left, fg_color="#0f1626", progress_color=ACCENT,
+            tab, fg_color="#0f1626", progress_color=ACCENT,
             height=6, corner_radius=3,
         )
-        self.progress.pack(fill="x", padx=16, pady=(0, 4))
+        self.progress.pack(fill="x", padx=8, pady=(0, 4))
         self.progress.set(0)
 
         self.status_label = ctk.CTkLabel(
-            left, text="Ready",
+            tab, text="Ready",
             font=ctk.CTkFont(size=11),
             text_color="#667788",
         )
-        self.status_label.pack(anchor="w", padx=16, pady=(0, 12))
+        self.status_label.pack(anchor="w", padx=8, pady=(0, 8))
+
+    def _build_sheets_tab(self, tab):
+        # ── Source directory ───────────────────────────────────────────────
+        src_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        src_frame.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(
+            src_frame, text="Source (card images folder)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(anchor="w")
+
+        src_row = ctk.CTkFrame(src_frame, fg_color="transparent")
+        src_row.pack(fill="x", pady=(4, 0))
+
+        self.sheets_src_label = ctk.CTkLabel(
+            src_row,
+            text="No folder selected — or use download folder →",
+            font=ctk.CTkFont(size=12),
+            text_color="#667788",
+            anchor="w",
+        )
+        self.sheets_src_label.pack(side="left", fill="x", expand=True)
+
+        src_btns = ctk.CTkFrame(src_row, fg_color="transparent")
+        src_btns.pack(side="right")
+
+        ctk.CTkButton(
+            src_btns, text="Use Download Dir", width=130,
+            fg_color="#2a2a4a", hover_color="#3a3a5a",
+            command=self._sheets_use_download_dir,
+        ).pack(side="left", padx=(0, 4))
+
+        ctk.CTkButton(
+            src_btns, text="Browse…", width=80,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._sheets_pick_source,
+        ).pack(side="left")
+
+        # ── Output directory ──────────────────────────────────────────────
+        out_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        out_frame.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(
+            out_frame, text="Output (sheet PNGs)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(anchor="w")
+
+        out_row = ctk.CTkFrame(out_frame, fg_color="transparent")
+        out_row.pack(fill="x", pady=(4, 0))
+
+        self.sheets_out_label = ctk.CTkLabel(
+            out_row,
+            text="Defaults to Source\\Sheets",
+            font=ctk.CTkFont(size=12),
+            text_color="#667788",
+            anchor="w",
+        )
+        self.sheets_out_label.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            out_row, text="Browse…", width=80,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._sheets_pick_output,
+        ).pack(side="right")
+
+        # ── Engine selector ───────────────────────────────────────────────
+        engine_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        engine_frame.pack(fill="x", padx=8, pady=(12, 4))
+
+        ctk.CTkLabel(
+            engine_frame, text="Engine",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(side="left")
+
+        engines = ["Built-in (Pillow)"]
+        default_engine = "Built-in (Pillow)"
+        if self.ps_available:
+            engines.insert(0, "Photoshop (COM)")
+            default_engine = "Photoshop (COM)"
+
+        self.engine_var = ctk.StringVar(value=default_engine)
+        self.engine_menu = ctk.CTkOptionMenu(
+            engine_frame,
+            variable=self.engine_var,
+            values=engines,
+            fg_color="#0f1626",
+            button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            width=200,
+        )
+        self.engine_menu.pack(side="left", padx=(12, 0))
+
+        if not self.ps_available:
+            ctk.CTkLabel(
+                engine_frame,
+                text="(pywin32 not installed — Photoshop unavailable)",
+                font=ctk.CTkFont(size=11),
+                text_color=WARN_AMBER,
+            ).pack(side="left", padx=(8, 0))
+
+        # ── Info label ────────────────────────────────────────────────────
+        info_text = (
+            "Creates printable 3×3 proxy sheets (8.5\"×11\" at 300 DPI).\n"
+            "Each sheet holds up to 9 cards. Images are sorted alphabetically.\n"
+            "Output: Sheet_001.png, Sheet_002.png, etc."
+        )
+        ctk.CTkLabel(
+            tab, text=info_text,
+            font=ctk.CTkFont(size=11),
+            text_color="#556677",
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        # ── Generate button ───────────────────────────────────────────────
+        gen_ctrl = ctk.CTkFrame(tab, fg_color="transparent")
+        gen_ctrl.pack(fill="x", padx=8, pady=(8, 8))
+
+        self.generate_btn = ctk.CTkButton(
+            gen_ctrl, text="📄  Generate Proxy Sheets", height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._start_sheet_generation,
+        )
+        self.generate_btn.pack(side="left", fill="x", expand=True)
+
+        # ── Sheet progress ────────────────────────────────────────────────
+        self.sheet_progress = ctk.CTkProgressBar(
+            tab, fg_color="#0f1626", progress_color=SUCCESS_GREEN,
+            height=6, corner_radius=3,
+        )
+        self.sheet_progress.pack(fill="x", padx=8, pady=(8, 4))
+        self.sheet_progress.set(0)
+
+        self.sheet_status_label = ctk.CTkLabel(
+            tab, text="Ready",
+            font=ctk.CTkFont(size=11),
+            text_color="#667788",
+        )
+        self.sheet_status_label.pack(anchor="w", padx=8, pady=(0, 8))
 
     def _build_right_panel(self, parent):
         right = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-        # ── Tab view: Log / Preview ───────────────────────────────────────
+        # ── Tab view: Log / Preview / Sheets ──────────────────────────────
         self.tabview = ctk.CTkTabview(
             right, fg_color=BG_CARD, segmented_button_fg_color="#0f1626",
             segmented_button_selected_color=ACCENT,
@@ -333,24 +723,72 @@ class MTGDeckImager(ctk.CTk):
         )
         self.log_box.pack(fill="both", expand=True)
 
-        # Preview tab
+        # Preview tab (card thumbnails)
         preview_tab = self.tabview.add("Preview")
         self.preview_scroll = ctk.CTkScrollableFrame(
             preview_tab, fg_color="#0f1626", corner_radius=8,
         )
         self.preview_scroll.pack(fill="both", expand=True)
 
-    # ── Actions ───────────────────────────────────────────────────────────
+        # Sheets tab (generated sheet previews)
+        sheets_preview_tab = self.tabview.add("Sheets")
+        self.sheets_preview_scroll = ctk.CTkScrollableFrame(
+            sheets_preview_tab, fg_color="#0f1626", corner_radius=8,
+        )
+        self.sheets_preview_scroll.pack(fill="both", expand=True)
+
+    # ── Directory Actions ─────────────────────────────────────────────────
 
     def _pick_directory(self):
         folder = filedialog.askdirectory(title="Select download folder")
         if folder:
             self.download_dir = folder
-            # Show abbreviated path if long
             display = folder
             if len(display) > 55:
                 display = "…" + display[-52:]
             self.dir_label.configure(text=display, text_color=SUCCESS_GREEN)
+
+    def _sheets_pick_source(self):
+        folder = filedialog.askdirectory(title="Select card images folder")
+        if folder:
+            self.sheets_source_dir = folder
+            display = folder
+            if len(display) > 45:
+                display = "…" + display[-42:]
+            self.sheets_src_label.configure(text=display, text_color=SUCCESS_GREEN)
+            # Auto-set output if not already set
+            if not self.sheets_output_dir:
+                out = str(Path(folder) / "Sheets")
+                self.sheets_output_dir = out
+                self.sheets_out_label.configure(text=out, text_color=TEXT_LIGHT)
+
+    def _sheets_pick_output(self):
+        folder = filedialog.askdirectory(title="Select output folder for sheets")
+        if folder:
+            self.sheets_output_dir = folder
+            display = folder
+            if len(display) > 45:
+                display = "…" + display[-42:]
+            self.sheets_out_label.configure(text=display, text_color=SUCCESS_GREEN)
+
+    def _sheets_use_download_dir(self):
+        if not self.download_dir:
+            messagebox.showinfo(
+                "No download folder",
+                "Pick a download folder on the Download tab first."
+            )
+            return
+        self.sheets_source_dir = self.download_dir
+        display = self.download_dir
+        if len(display) > 45:
+            display = "…" + display[-42:]
+        self.sheets_src_label.configure(text=display, text_color=SUCCESS_GREEN)
+        # Auto-set output
+        out = str(Path(self.download_dir) / "Sheets")
+        self.sheets_output_dir = out
+        self.sheets_out_label.configure(text=out, text_color=TEXT_LIGHT)
+
+    # ── Clear ─────────────────────────────────────────────────────────────
 
     def _clear_all(self):
         self.decklist_box.delete("1.0", "end")
@@ -359,10 +797,11 @@ class MTGDeckImager(ctk.CTk):
         self.log_box.configure(state="disabled")
         self.progress.set(0)
         self.status_label.configure(text="Ready", text_color="#667788")
-        # Clear preview thumbnails
         for widget in self.preview_scroll.winfo_children():
             widget.destroy()
         self.thumbnail_refs.clear()
+
+    # ── Logging ───────────────────────────────────────────────────────────
 
     def _log(self, msg: str, color: str = TEXT_LIGHT):
         self.log_box.configure(state="normal")
@@ -372,6 +811,8 @@ class MTGDeckImager(ctk.CTk):
 
     def _set_status(self, text: str, color: str = "#667788"):
         self.status_label.configure(text=text, text_color=color)
+
+    # ── Download Logic ────────────────────────────────────────────────────
 
     def _start_download(self):
         if self.is_downloading:
@@ -396,6 +837,9 @@ class MTGDeckImager(ctk.CTk):
         for widget in self.preview_scroll.winfo_children():
             widget.destroy()
         self.thumbnail_refs.clear()
+
+        # Switch to Log tab
+        self.tabview.set("Log")
 
         thread = threading.Thread(
             target=self._download_worker, args=(text,), daemon=True
@@ -453,7 +897,6 @@ class MTGDeckImager(ctk.CTk):
                     if ok:
                         success_count += 1
                         self.after(0, lambda f=filename: self._log(f"✅ {f}"))
-                        # Add thumbnail preview
                         self.after(0, lambda p=file_path: self._add_thumbnail(p))
                     else:
                         fail_count += 1
@@ -471,7 +914,6 @@ class MTGDeckImager(ctk.CTk):
             prog = (idx + 1) / total
             self.after(0, lambda p=prog: self.progress.set(p))
 
-        # Summary
         summary = f"Done — {success_count} saved, {fail_count} failed"
         color = SUCCESS_GREEN if fail_count == 0 else WARN_AMBER
         self.after(0, lambda: self._log(f"\n{'─'*40}"))
@@ -485,10 +927,8 @@ class MTGDeckImager(ctk.CTk):
         self.progress.set(1)
 
     def _add_thumbnail(self, path: Path):
-        """Add a card thumbnail to the preview panel."""
         try:
             img = Image.open(path)
-            # Scale to ~140px wide for thumbnail
             ratio = 140 / img.width
             thumb_size = (140, int(img.height * ratio))
             img = img.resize(thumb_size, Image.LANCZOS)
@@ -500,7 +940,134 @@ class MTGDeckImager(ctk.CTk):
             )
             lbl.pack(side="left", padx=4, pady=4)
         except Exception:
-            pass  # thumbnail is a nice-to-have, don't crash
+            pass
+
+    # ── Sheet Generation Logic ────────────────────────────────────────────
+
+    def _start_sheet_generation(self):
+        if self.is_generating_sheets:
+            return
+
+        if not self.sheets_source_dir:
+            messagebox.showwarning(
+                "No source folder",
+                "Pick a source folder of card images first."
+            )
+            return
+
+        source = Path(self.sheets_source_dir)
+        if not source.is_dir():
+            messagebox.showerror("Invalid folder", f"Source folder does not exist:\n{source}")
+            return
+
+        output = Path(self.sheets_output_dir) if self.sheets_output_dir else source / "Sheets"
+        self.sheets_output_dir = str(output)
+
+        engine = self.engine_var.get()
+
+        self.is_generating_sheets = True
+        self.generate_btn.configure(state="disabled", text="Generating…")
+        self.sheet_progress.set(0)
+
+        # Clear sheet previews
+        for widget in self.sheets_preview_scroll.winfo_children():
+            widget.destroy()
+        self.sheet_thumb_refs.clear()
+
+        # Clear and switch to log
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.tabview.set("Log")
+
+        thread = threading.Thread(
+            target=self._sheet_worker,
+            args=(source, output, engine),
+            daemon=True,
+        )
+        thread.start()
+
+    def _sheet_worker(self, source: Path, output: Path, engine: str):
+        def on_log(msg):
+            self.after(0, lambda m=msg: self._log(m))
+
+        def on_progress(p):
+            self.after(0, lambda v=p: self.sheet_progress.set(v))
+
+        self.after(0, lambda: self._log(f"🔧 Engine: {engine}"))
+        self.after(0, lambda: self._log(f"📂 Source: {source}"))
+        self.after(0, lambda: self._log(f"📁 Output: {output}"))
+        self.after(0, lambda: self.sheet_status_label.configure(
+            text="Generating sheets…", text_color=ACCENT
+        ))
+
+        use_photoshop = engine.startswith("Photoshop")
+
+        if use_photoshop:
+            try:
+                success, fail = generate_sheets_photoshop(
+                    source, output, on_log, on_progress
+                )
+            except Exception as exc:
+                on_log(f"❌ Photoshop failed: {exc}")
+                on_log("⚠️  Falling back to Built-in (Pillow)…")
+                success, fail = generate_sheets_pillow(
+                    source, output, on_log, on_progress
+                )
+        else:
+            success, fail = generate_sheets_pillow(
+                source, output, on_log, on_progress
+            )
+
+        # Summary
+        total = success + fail
+        summary = f"Sheets: {success}/{total} created"
+        color = SUCCESS_GREEN if fail == 0 else WARN_AMBER
+        self.after(0, lambda: self._log(f"\n{'─'*40}"))
+        self.after(0, lambda s=summary: self._log(s))
+        self.after(0, lambda s=summary, c=color: self.sheet_status_label.configure(
+            text=s, text_color=c
+        ))
+
+        # Add sheet preview thumbnails
+        if output.is_dir():
+            sheets = sorted(output.glob("Sheet_*.png"))
+            for sp in sheets:
+                self.after(0, lambda p=sp: self._add_sheet_thumbnail(p))
+
+        self.after(0, self._sheet_generation_done)
+
+    def _sheet_generation_done(self):
+        self.is_generating_sheets = False
+        self.generate_btn.configure(state="normal", text="📄  Generate Proxy Sheets")
+        self.sheet_progress.set(1)
+        # Switch right panel to Sheets tab to show previews
+        self.tabview.set("Sheets")
+
+    def _add_sheet_thumbnail(self, path: Path):
+        try:
+            img = Image.open(path)
+            # Scale to ~280px wide for sheet preview
+            ratio = 280 / img.width
+            thumb_size = (280, int(img.height * ratio))
+            img = img.resize(thumb_size, Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.sheet_thumb_refs.append(photo)
+
+            frame = ctk.CTkFrame(self.sheets_preview_scroll, fg_color="transparent")
+            frame.pack(pady=6, padx=4)
+
+            ctk.CTkLabel(
+                frame, image=photo, text="",
+            ).pack()
+
+            ctk.CTkLabel(
+                frame, text=path.name,
+                font=ctk.CTkFont(size=11),
+                text_color="#8899aa",
+            ).pack()
+        except Exception:
+            pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
