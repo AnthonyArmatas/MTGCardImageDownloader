@@ -357,10 +357,14 @@ def generate_sheets_photoshop(
             manifest_lines = [str(out_path)] + [str(p) for p in batch]
             manifest_path.write_text("\n".join(manifest_lines), encoding="utf-8")
 
-            # Inject manifest path and run JSX
+            # Write the complete JSX to a temp file and run via DoJavascriptFile.
+            # DoJavascript with large inline strings fails through Python COM dispatch.
             escaped = str(manifest_path).replace("\\", "/")
             jsx_with_manifest = f"var __manifestPath = '{escaped}';\n" + jsx_content
-            result = ps.DoJavascript(jsx_with_manifest)
+            jsx_tmp = Path(tempfile.gettempdir()) / "mtg_sheet_run.jsx"
+            jsx_tmp.write_text(jsx_with_manifest, encoding="utf-8")
+
+            result = ps.DoJavascriptFile(str(jsx_tmp))
 
             if result == "OK":
                 success += 1
@@ -371,9 +375,11 @@ def generate_sheets_photoshop(
                 if on_log:
                     on_log(f"  ⚠️ {filename}: {result}")
 
-            # Clean up manifest
+            # Clean up temp files
             if manifest_path.exists():
                 manifest_path.unlink()
+            if jsx_tmp.exists():
+                jsx_tmp.unlink()
 
         except Exception as exc:
             fail += 1
@@ -382,6 +388,207 @@ def generate_sheets_photoshop(
 
         if on_progress:
             on_progress((i + 1) / total_sheets)
+
+    return success, fail
+
+
+# ── Art Swap (Proxy Art Replacement) ──────────────────────────────────────────
+
+def find_art_box(frame_img: Image.Image) -> tuple[int, int, int, int] | None:
+    """
+    Detect the art box in a frame template by finding the bounding box of
+    the transparent (alpha=0) region. Returns (left, top, right, bottom)
+    or None if no transparent region found.
+    """
+    if frame_img.mode != "RGBA":
+        return None
+
+    alpha = frame_img.split()[3]  # alpha channel
+    # Invert: we want the bounding box of the transparent region
+    # getbbox() finds non-zero pixels, so invert alpha first
+    from PIL import ImageOps
+    inverted = ImageOps.invert(alpha)
+    bbox = inverted.getbbox()
+    return bbox
+
+
+def cover_fit(art: Image.Image, box_w: int, box_h: int) -> Image.Image:
+    """
+    Scale art to cover the box while preserving aspect ratio (cover-fit).
+    The art is scaled so the *smaller* dimension fills the box, then
+    center-cropped to exact box size. No stretching or squashing.
+    """
+    art_w, art_h = art.size
+    scale = max(box_w / art_w, box_h / art_h)
+    new_w = round(art_w * scale)
+    new_h = round(art_h * scale)
+    art_scaled = art.resize((new_w, new_h), Image.LANCZOS)
+
+    # Center crop to exact box size
+    left = (new_w - box_w) // 2
+    top = (new_h - box_h) // 2
+    return art_scaled.crop((left, top, left + box_w, top + box_h))
+
+
+def swap_art_single(
+    frame_path: Path,
+    art_path: Path,
+    output_path: Path,
+    on_log=None,
+) -> bool:
+    """
+    Composite one card: art underneath, frame template on top.
+    The frame template must be a PNG with a transparent hole where the art goes.
+    Returns True on success.
+    """
+    try:
+        frame = Image.open(frame_path).convert("RGBA")
+        art = Image.open(art_path).convert("RGBA")
+
+        art_box = find_art_box(frame)
+        if art_box is None:
+            if on_log:
+                on_log(f"⚠️  No transparent region in {frame_path.name} — skipping")
+            return False
+
+        left, top, right, bottom = art_box
+        box_w = right - left
+        box_h = bottom - top
+
+        # Cover-fit the art to the box
+        art_fitted = cover_fit(art, box_w, box_h)
+
+        # Composite: start with white background at frame size
+        result = Image.new("RGBA", frame.size, (255, 255, 255, 255))
+        # Paste fitted art into the art box position
+        result.paste(art_fitted, (left, top))
+        # Paste frame on top (with alpha)
+        result = Image.alpha_composite(result, frame)
+
+        # Save as RGB PNG (no alpha in final output)
+        result.convert("RGB").save(str(output_path), "PNG")
+
+        frame.close()
+        art.close()
+        return True
+    except Exception as exc:
+        if on_log:
+            on_log(f"❌ Art swap error ({art_path.name}): {exc}")
+        return False
+
+
+def swap_art_batch(
+    frame_path: Path,
+    art_dir: Path,
+    output_dir: Path,
+    on_log=None,
+    on_progress=None,
+) -> tuple[int, int]:
+    """
+    Batch art swap: one frame template + folder of art images → folder of proxies.
+    Each art image gets composited with the same frame.
+    Returns (success_count, fail_count).
+    """
+    art_images = [
+        f for f in art_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_IMG_EXTS
+    ]
+    art_images.sort(key=lambda p: p.name.lower())
+
+    if not art_images:
+        if on_log:
+            on_log("❌ No art images found (.png, .jpg, .jpeg)")
+        return 0, 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total = len(art_images)
+
+    if on_log:
+        on_log(f"📋 Found {total} art image(s)")
+        on_log(f"🖼️  Frame: {frame_path.name}")
+        on_log(f"📁 Output: {output_dir}")
+
+    success = 0
+    fail = 0
+
+    for idx, art_path in enumerate(art_images):
+        out_name = f"proxy_{art_path.stem}.png"
+        out_path = output_dir / out_name
+
+        ok = swap_art_single(frame_path, art_path, out_path, on_log)
+        if ok:
+            success += 1
+            if on_log:
+                on_log(f"  ✅ {out_name}")
+        else:
+            fail += 1
+
+        if on_progress:
+            on_progress((idx + 1) / total)
+
+    return success, fail
+
+
+def swap_art_paired(
+    frames_dir: Path,
+    art_dir: Path,
+    output_dir: Path,
+    on_log=None,
+    on_progress=None,
+) -> tuple[int, int]:
+    """
+    Paired art swap: match frame templates to art images by sorted order.
+    Frame 1 + Art 1 → Proxy 1, Frame 2 + Art 2 → Proxy 2, etc.
+    Returns (success_count, fail_count).
+    """
+    frames = [
+        f for f in frames_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_IMG_EXTS
+    ]
+    frames.sort(key=lambda p: p.name.lower())
+
+    arts = [
+        f for f in art_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_IMG_EXTS
+    ]
+    arts.sort(key=lambda p: p.name.lower())
+
+    if not frames:
+        if on_log:
+            on_log("❌ No frame templates found")
+        return 0, 0
+    if not arts:
+        if on_log:
+            on_log("❌ No art images found")
+        return 0, 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pairs = list(zip(frames, arts))
+    total = len(pairs)
+
+    if on_log:
+        on_log(f"📋 Pairing {len(frames)} frame(s) with {len(arts)} art image(s)")
+        on_log(f"   → {total} pair(s) to process")
+        if len(frames) != len(arts):
+            on_log(f"   ⚠️  Counts differ — extra files will be skipped")
+
+    success = 0
+    fail = 0
+
+    for idx, (frame_path, art_path) in enumerate(pairs):
+        out_name = f"proxy_{art_path.stem}.png"
+        out_path = output_dir / out_name
+
+        ok = swap_art_single(frame_path, art_path, out_path, on_log)
+        if ok:
+            success += 1
+            if on_log:
+                on_log(f"  ✅ {out_name} ({frame_path.name} + {art_path.name})")
+        else:
+            fail += 1
+
+        if on_progress:
+            on_progress((idx + 1) / total)
 
     return success, fail
 
@@ -416,10 +623,16 @@ class MTGDeckImager(ctk.CTk):
         self.download_dir: str | None = None
         self.sheets_source_dir: str | None = None
         self.sheets_output_dir: str | None = None
+        self.swap_frame_path: str | None = None
+        self.swap_frames_dir: str | None = None
+        self.swap_art_dir: str | None = None
+        self.swap_output_dir: str | None = None
         self.is_downloading = False
         self.is_generating_sheets = False
+        self.is_swapping_art = False
         self.thumbnail_refs: list = []  # prevent GC of PhotoImage refs
         self.sheet_thumb_refs: list = []
+        self.swap_thumb_refs: list = []
         self.ps_available = check_photoshop_available()
 
         self._build_ui()
@@ -437,7 +650,7 @@ class MTGDeckImager(ctk.CTk):
             text_color=ACCENT,
         ).pack(side="left", padx=20)
         ctk.CTkLabel(
-            banner, text="Download card art from Scryfall  ·  Generate proxy sheets",
+            banner, text="Download  ·  Proxy Sheets  ·  Art Swap",
             font=ctk.CTkFont(size=13),
             text_color="#8899aa",
         ).pack(side="left", padx=8)
@@ -467,9 +680,11 @@ class MTGDeckImager(ctk.CTk):
 
         dl_tab = self.left_tabs.add("⬇ Download")
         sheets_tab = self.left_tabs.add("📄 Proxy Sheets")
+        swap_tab = self.left_tabs.add("🎨 Art Swap")
 
         self._build_download_tab(dl_tab)
         self._build_sheets_tab(sheets_tab)
+        self._build_swap_tab(swap_tab)
 
     def _build_download_tab(self, tab):
         # ── Directory picker ──────────────────────────────────────────────
@@ -701,6 +916,187 @@ class MTGDeckImager(ctk.CTk):
         )
         self.sheet_status_label.pack(anchor="w", padx=8, pady=(0, 8))
 
+    def _build_swap_tab(self, tab):
+        # ── Mode selector ─────────────────────────────────────────────────
+        mode_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        mode_frame.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(
+            mode_frame, text="Mode",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(side="left")
+
+        self.swap_mode_var = ctk.StringVar(value="Single Frame + Art Folder")
+        self.swap_mode_menu = ctk.CTkOptionMenu(
+            mode_frame,
+            variable=self.swap_mode_var,
+            values=["Single Frame + Art Folder", "Paired (Frames Folder + Art Folder)"],
+            fg_color="#0f1626",
+            button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            width=290,
+            command=self._swap_mode_changed,
+        )
+        self.swap_mode_menu.pack(side="left", padx=(12, 0))
+
+        # ── Frame template (single file) ──────────────────────────────────
+        self.swap_frame_single = ctk.CTkFrame(tab, fg_color="transparent")
+        self.swap_frame_single.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(
+            self.swap_frame_single, text="Frame Template (PNG with transparent art hole)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(anchor="w")
+
+        sf_row = ctk.CTkFrame(self.swap_frame_single, fg_color="transparent")
+        sf_row.pack(fill="x", pady=(4, 0))
+
+        self.swap_frame_label = ctk.CTkLabel(
+            sf_row,
+            text="No file selected",
+            font=ctk.CTkFont(size=12),
+            text_color="#667788",
+            anchor="w",
+        )
+        self.swap_frame_label.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            sf_row, text="Pick File…", width=90,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._swap_pick_frame_file,
+        ).pack(side="right")
+
+        # ── Frames folder (paired mode) ───────────────────────────────────
+        self.swap_frames_folder = ctk.CTkFrame(tab, fg_color="transparent")
+        # Hidden by default (single mode active)
+
+        ctk.CTkLabel(
+            self.swap_frames_folder, text="Frames Folder (each frame paired to art by sort order)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(anchor="w")
+
+        ff_row = ctk.CTkFrame(self.swap_frames_folder, fg_color="transparent")
+        ff_row.pack(fill="x", pady=(4, 0))
+
+        self.swap_frames_dir_label = ctk.CTkLabel(
+            ff_row,
+            text="No folder selected",
+            font=ctk.CTkFont(size=12),
+            text_color="#667788",
+            anchor="w",
+        )
+        self.swap_frames_dir_label.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            ff_row, text="Browse…", width=80,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._swap_pick_frames_dir,
+        ).pack(side="right")
+
+        # ── Art folder ────────────────────────────────────────────────────
+        art_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        art_frame.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(
+            art_frame, text="Art Images Folder",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(anchor="w")
+
+        art_row = ctk.CTkFrame(art_frame, fg_color="transparent")
+        art_row.pack(fill="x", pady=(4, 0))
+
+        self.swap_art_label = ctk.CTkLabel(
+            art_row,
+            text="No folder selected",
+            font=ctk.CTkFont(size=12),
+            text_color="#667788",
+            anchor="w",
+        )
+        self.swap_art_label.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            art_row, text="Browse…", width=80,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._swap_pick_art_dir,
+        ).pack(side="right")
+
+        # ── Output folder ─────────────────────────────────────────────────
+        out_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        out_frame.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(
+            out_frame, text="Output Folder",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(anchor="w")
+
+        out_row = ctk.CTkFrame(out_frame, fg_color="transparent")
+        out_row.pack(fill="x", pady=(4, 0))
+
+        self.swap_out_label = ctk.CTkLabel(
+            out_row,
+            text="Defaults to Art Folder\\Proxies",
+            font=ctk.CTkFont(size=12),
+            text_color="#667788",
+            anchor="w",
+        )
+        self.swap_out_label.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            out_row, text="Browse…", width=80,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._swap_pick_output_dir,
+        ).pack(side="right")
+
+        # ── Info ──────────────────────────────────────────────────────────
+        info_text = (
+            "How it works:\n"
+            "1. Create a frame template: open a card in Photoshop, erase the\n"
+            "   art area so it's transparent, save as PNG\n"
+            "2. Pick your replacement art images\n"
+            "3. The tool does cover-fit (no stretch) and composites automatically\n"
+            "\n"
+            "Single mode: 1 frame + many art images → many proxies\n"
+            "Paired mode: N frames + N art images → matched by sort order"
+        )
+        ctk.CTkLabel(
+            tab, text=info_text,
+            font=ctk.CTkFont(size=11),
+            text_color="#556677",
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        # ── Generate button ───────────────────────────────────────────────
+        swap_ctrl = ctk.CTkFrame(tab, fg_color="transparent")
+        swap_ctrl.pack(fill="x", padx=8, pady=(8, 8))
+
+        self.swap_btn = ctk.CTkButton(
+            swap_ctrl, text="🎨  Swap Art", height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._start_art_swap,
+        )
+        self.swap_btn.pack(side="left", fill="x", expand=True)
+
+        # ── Progress ──────────────────────────────────────────────────────
+        self.swap_progress = ctk.CTkProgressBar(
+            tab, fg_color="#0f1626", progress_color=SUCCESS_GREEN,
+            height=6, corner_radius=3,
+        )
+        self.swap_progress.pack(fill="x", padx=8, pady=(8, 4))
+        self.swap_progress.set(0)
+
+        self.swap_status_label = ctk.CTkLabel(
+            tab, text="Ready",
+            font=ctk.CTkFont(size=11),
+            text_color="#667788",
+        )
+        self.swap_status_label.pack(anchor="w", padx=8, pady=(0, 8))
+
     def _build_right_panel(self, parent):
         right = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -736,6 +1132,13 @@ class MTGDeckImager(ctk.CTk):
             sheets_preview_tab, fg_color="#0f1626", corner_radius=8,
         )
         self.sheets_preview_scroll.pack(fill="both", expand=True)
+
+        # Art Swap tab (proxy previews)
+        swap_preview_tab = self.tabview.add("Art Swap")
+        self.swap_preview_scroll = ctk.CTkScrollableFrame(
+            swap_preview_tab, fg_color="#0f1626", corner_radius=8,
+        )
+        self.swap_preview_scroll.pack(fill="both", expand=True)
 
     # ── Directory Actions ─────────────────────────────────────────────────
 
@@ -1064,6 +1467,183 @@ class MTGDeckImager(ctk.CTk):
             ctk.CTkLabel(
                 frame, text=path.name,
                 font=ctk.CTkFont(size=11),
+                text_color="#8899aa",
+            ).pack()
+        except Exception:
+            pass
+
+
+    # ── Art Swap Logic ────────────────────────────────────────────────────
+
+    def _swap_mode_changed(self, value):
+        if value.startswith("Single"):
+            self.swap_frame_single.pack(fill="x", padx=8, pady=(8, 4))
+            self.swap_frames_folder.pack_forget()
+        else:
+            self.swap_frame_single.pack_forget()
+            self.swap_frames_folder.pack(fill="x", padx=8, pady=(8, 4))
+
+    def _swap_pick_frame_file(self):
+        path = filedialog.askopenfilename(
+            title="Select frame template PNG",
+            filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
+        )
+        if path:
+            self.swap_frame_path = path
+            name = Path(path).name
+            self.swap_frame_label.configure(text=name, text_color=SUCCESS_GREEN)
+
+    def _swap_pick_frames_dir(self):
+        folder = filedialog.askdirectory(title="Select frames folder")
+        if folder:
+            self.swap_frames_dir = folder
+            display = folder if len(folder) <= 45 else "…" + folder[-42:]
+            self.swap_frames_dir_label.configure(text=display, text_color=SUCCESS_GREEN)
+
+    def _swap_pick_art_dir(self):
+        folder = filedialog.askdirectory(title="Select art images folder")
+        if folder:
+            self.swap_art_dir = folder
+            display = folder if len(folder) <= 45 else "…" + folder[-42:]
+            self.swap_art_label.configure(text=display, text_color=SUCCESS_GREEN)
+            if not self.swap_output_dir:
+                out = str(Path(folder) / "Proxies")
+                self.swap_output_dir = out
+                self.swap_out_label.configure(text=out, text_color=TEXT_LIGHT)
+
+    def _swap_pick_output_dir(self):
+        folder = filedialog.askdirectory(title="Select output folder for proxies")
+        if folder:
+            self.swap_output_dir = folder
+            display = folder if len(folder) <= 45 else "…" + folder[-42:]
+            self.swap_out_label.configure(text=display, text_color=SUCCESS_GREEN)
+
+    def _start_art_swap(self):
+        if self.is_swapping_art:
+            return
+
+        mode = self.swap_mode_var.get()
+        is_single = mode.startswith("Single")
+
+        if is_single and not self.swap_frame_path:
+            messagebox.showwarning("No frame", "Pick a frame template file first.")
+            return
+        if not is_single and not self.swap_frames_dir:
+            messagebox.showwarning("No frames folder", "Pick a frames folder first.")
+            return
+        if not self.swap_art_dir:
+            messagebox.showwarning("No art folder", "Pick an art images folder first.")
+            return
+
+        art_dir = Path(self.swap_art_dir)
+        if not art_dir.is_dir():
+            messagebox.showerror("Invalid folder", f"Art folder does not exist:\n{art_dir}")
+            return
+
+        output = Path(self.swap_output_dir) if self.swap_output_dir else art_dir / "Proxies"
+        self.swap_output_dir = str(output)
+
+        self.is_swapping_art = True
+        self.swap_btn.configure(state="disabled", text="Swapping…")
+        self.swap_progress.set(0)
+
+        # Clear swap previews
+        for widget in self.swap_preview_scroll.winfo_children():
+            widget.destroy()
+        self.swap_thumb_refs.clear()
+
+        # Clear and switch to log
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.tabview.set("Log")
+
+        if is_single:
+            frame_path = Path(self.swap_frame_path)
+            thread = threading.Thread(
+                target=self._swap_worker_single,
+                args=(frame_path, art_dir, output),
+                daemon=True,
+            )
+        else:
+            frames_dir = Path(self.swap_frames_dir)
+            thread = threading.Thread(
+                target=self._swap_worker_paired,
+                args=(frames_dir, art_dir, output),
+                daemon=True,
+            )
+        thread.start()
+
+    def _swap_worker_single(self, frame_path: Path, art_dir: Path, output: Path):
+        def on_log(msg):
+            self.after(0, lambda m=msg: self._log(m))
+
+        def on_progress(p):
+            self.after(0, lambda v=p: self.swap_progress.set(v))
+
+        self.after(0, lambda: self._log("🎨 Art Swap — Single Frame mode"))
+        self.after(0, lambda: self.swap_status_label.configure(
+            text="Swapping art…", text_color=ACCENT
+        ))
+
+        success, fail = swap_art_batch(frame_path, art_dir, output, on_log, on_progress)
+        self._swap_finish(success, fail, output)
+
+    def _swap_worker_paired(self, frames_dir: Path, art_dir: Path, output: Path):
+        def on_log(msg):
+            self.after(0, lambda m=msg: self._log(m))
+
+        def on_progress(p):
+            self.after(0, lambda v=p: self.swap_progress.set(v))
+
+        self.after(0, lambda: self._log("🎨 Art Swap — Paired mode"))
+        self.after(0, lambda: self.swap_status_label.configure(
+            text="Swapping art…", text_color=ACCENT
+        ))
+
+        success, fail = swap_art_paired(frames_dir, art_dir, output, on_log, on_progress)
+        self._swap_finish(success, fail, output)
+
+    def _swap_finish(self, success: int, fail: int, output: Path):
+        total = success + fail
+        summary = f"Art Swap: {success}/{total} created"
+        color = SUCCESS_GREEN if fail == 0 else WARN_AMBER
+        self.after(0, lambda: self._log(f"\n{'─'*40}"))
+        self.after(0, lambda s=summary: self._log(s))
+        self.after(0, lambda s=summary, c=color: self.swap_status_label.configure(
+            text=s, text_color=c
+        ))
+
+        # Add proxy previews
+        if output.is_dir():
+            proxies = sorted(output.glob("proxy_*.png"))
+            for p in proxies:
+                self.after(0, lambda path=p: self._add_swap_thumbnail(path))
+
+        self.after(0, self._swap_done)
+
+    def _swap_done(self):
+        self.is_swapping_art = False
+        self.swap_btn.configure(state="normal", text="🎨  Swap Art")
+        self.swap_progress.set(1)
+        self.tabview.set("Art Swap")
+
+    def _add_swap_thumbnail(self, path: Path):
+        try:
+            img = Image.open(path)
+            ratio = 160 / img.width
+            thumb_size = (160, int(img.height * ratio))
+            img = img.resize(thumb_size, Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.swap_thumb_refs.append(photo)
+
+            frame = ctk.CTkFrame(self.swap_preview_scroll, fg_color="transparent")
+            frame.pack(side="left", pady=4, padx=4)
+
+            ctk.CTkLabel(frame, image=photo, text="").pack()
+            ctk.CTkLabel(
+                frame, text=path.name,
+                font=ctk.CTkFont(size=10),
                 text_color="#8899aa",
             ).pack()
         except Exception:

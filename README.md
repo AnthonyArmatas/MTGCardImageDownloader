@@ -10,6 +10,31 @@ A desktop application that downloads high-resolution MTG card images from [Scryf
 
 A rewrite of the original **MTG Card Image Downloader** (Blazor Server app) as a self-contained desktop application with a modern dark-themed UI. No web server, no browser — just double-click the `.exe`.
 
+## Features
+
+### ⬇ Download Cards
+Paste a decklist, pick a folder, download high-res PNGs from Scryfall.
+- Multiple decklist formats (see below)
+- Handles single-face and double-face cards
+- Progress bar, real-time log, and thumbnail previews
+- 100ms rate limiting per Scryfall guidelines
+
+### 📄 Proxy Sheets
+Generate printable 3×3 card sheets (8.5"×11" at 300 DPI) from a folder of card images.
+- **Photoshop (COM)** engine — uses ExtendScript via `CreateSheet.jsx` (requires Adobe Photoshop)
+- **Built-in (Pillow)** engine — pure Python, no Photoshop needed, identical output
+- Auto-falls back to Pillow if Photoshop fails
+- Output: `Sheet_001.png`, `Sheet_002.png`, etc.
+
+### 🎨 Art Swap
+Replace card art with custom images using frame templates.
+- **Single Frame mode** — one frame template + many art images → many proxies
+- **Paired mode** — N frames + N art images → matched by alphabetical sort order
+- Cover-fit scaling (no stretch/squash) — preserves aspect ratio automatically
+- Works with any image size or resolution
+
+**How to create a frame template:** Open a card in Photoshop, erase the center art area so it's transparent, save as PNG. The tool detects the transparent region and fills it with your art.
+
 ## What Changed From The Original
 
 ### Original App (Blazor Server)
@@ -17,10 +42,8 @@ A rewrite of the original **MTG Card Image Downloader** (Blazor Server app) as a
 - Single textarea + button on a default Blazor template
 - Hard-coded download directory (`wwwroot/downloaded-pngs`)
 - Only parsed one decklist format: `1 Card Name (SET) COLLECTOR`
-- No progress indication
-- No image previews
-- Included unused boilerplate pages (Counter, Weather, Home)
-- Commented-out Photoshop COM automation code
+- No progress indication, no image previews
+- Commented-out Photoshop COM automation code (non-functional)
 
 ### New App (Python Desktop)
 | Feature | Original | New |
@@ -30,12 +53,11 @@ A rewrite of the original **MTG Card Image Downloader** (Blazor Server app) as a
 | **Decklist formats** | `1 Name (SET) NUM` only | Multiple formats (see below) |
 | **Progress tracking** | None | Progress bar + real-time log |
 | **Image preview** | None | Thumbnail gallery of downloaded cards |
-| **UI theme** | Default Blazor/Bootstrap template | Dark MTG-themed UI |
-| **Scryfall lookup** | Set + collector only | Set + collector with name-search fallback |
-| **Double-face cards** | Supported | Supported (unchanged) |
-| **Section headers** | Not handled (would error) | Sideboard/Commander/Deck headers skipped |
+| **UI theme** | Default Blazor/Bootstrap template | Dark MTG-themed UI with tabs |
+| **Proxy sheets** | None | 3×3 grid sheets via Photoshop COM or Pillow |
+| **Art swap** | None | Frame template + custom art compositing |
 | **Error handling** | Generic exception catch | Per-card error reporting in log panel |
-| **Rate limiting** | None (could get throttled) | 100ms delay between API calls per Scryfall guidelines |
+| **Rate limiting** | None (could get throttled) | 100ms delay between API calls |
 
 ### Supported Decklist Formats
 ```
@@ -47,11 +69,6 @@ A rewrite of the original **MTG Card Image Downloader** (Blazor Server app) as a
 Sideboard                         # Section headers (skipped)
 // comment                        # Comments (skipped)
 ```
-
-### What Was Dropped
-- **Counter page** — Blazor template boilerplate, not MTG-related
-- **Weather page** — Blazor template boilerplate, not MTG-related
-- **Photoshop COM integration** — Was commented out and non-functional; depends on a local Photoshop install via COM interop. Could be re-added as a separate feature if needed.
 
 ## How To Run
 
@@ -68,30 +85,28 @@ python mtg_deck_imager.py
 ```
 
 ### Option C: Rebuild the .exe
+
+Double-click `build.cmd`, or from a terminal:
+```powershell
+.\build.cmd
+```
+
+This installs dependencies and rebuilds `dist\MTGDeckImager.exe`. Requires Python 3.10+ on PATH.
+
+You can also build manually:
 ```powershell
 pip install -r requirements.txt
 python build_exe.py
-# Output: dist\MTGDeckImager.exe
 ```
-
-## How It Works
-
-1. **Paste a decklist** into the text area (any of the supported formats above)
-2. **Pick a save folder** using the Browse button — the selected path is displayed
-3. **Click "Download Cards"** — the app:
-   - Parses each line to extract card name, set code, and collector number
-   - Queries the Scryfall API for each card
-   - Downloads the PNG image (or both faces for double-faced cards)
-   - Saves files as `SET_COLLECTOR_CardName.png`
-4. **Watch progress** in the progress bar and log panel
-5. **Preview downloads** in the Preview tab — thumbnails appear as cards download
 
 ## Project Structure
 
 ```
 MTGDeckImager/
-├── mtg_deck_imager.py    # Main application (GUI + Scryfall logic)
-├── build_exe.py          # PyInstaller build script
+├── mtg_deck_imager.py    # Main application (GUI + all features)
+├── CreateSheet.jsx       # Photoshop ExtendScript for proxy sheet generation
+├── build_exe.py          # PyInstaller build script (Python)
+├── build.cmd             # One-click build (installs deps + builds exe)
 ├── requirements.txt      # Python dependencies
 ├── README.md             # This file
 ├── dist/
@@ -103,7 +118,8 @@ MTGDeckImager/
 
 - **GUI**: [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) — modern dark-themed Tkinter wrapper
 - **API**: [Scryfall REST API](https://scryfall.com/docs/api) — free MTG card database
-- **Image handling**: Pillow for thumbnail generation
-- **Packaging**: PyInstaller `--onefile --windowed` for a single `.exe` with no console
-- **Threading**: Downloads run in a background thread to keep the UI responsive
+- **Image handling**: Pillow for thumbnails, proxy sheets, and art swap compositing
+- **Photoshop integration**: COM automation via pywin32 + ExtendScript (`CreateSheet.jsx`)
+- **Packaging**: PyInstaller `--onefile --windowed` for a single `.exe` with no console window
+- **Threading**: All heavy operations run in background threads to keep the UI responsive
 - **Rate limiting**: 100ms between Scryfall requests per their [good citizenship guidelines](https://scryfall.com/docs/api)
