@@ -27,10 +27,14 @@ app.preferences.rulerUnits = Units.PIXELS;
 // --- Standard art box ratios (percentage of card dimensions) -----------------
 // These are approximate for a standard MTG card frame.
 // Left, Top, Right, Bottom as fraction of card width/height.
-var STD_ART_LEFT   = 0.065;   // ~6.5% from left edge
-var STD_ART_TOP    = 0.112;   // ~11.2% from top
-var STD_ART_RIGHT  = 0.935;   // ~93.5% from left (= 6.5% from right)
-var STD_ART_BOTTOM = 0.555;   // ~55.5% from top
+// ADJUST THESE if the cutout doesn't match your cards:
+var STD_ART_LEFT   = 0.084;   // ~8.4% from left edge
+var STD_ART_TOP    = 0.125;   // ~12.5% from top (below title bar)
+var STD_ART_RIGHT  = 0.916;   // ~91.6% from left
+var STD_ART_BOTTOM = 0.538;   // ~53.8% from top (above type line)
+
+// Extra inward padding (pixels) — increase to cut less into the frame
+var PADDING = 3;
 
 // =============================================================================
 
@@ -57,11 +61,11 @@ try {
         artBottom = selBounds[3].as("px");
         hasSelection = true;
     } catch (e) {
-        // No selection — use standard ratios
-        artLeft   = Math.round(cardW * STD_ART_LEFT);
-        artTop    = Math.round(cardH * STD_ART_TOP);
-        artRight  = Math.round(cardW * STD_ART_RIGHT);
-        artBottom = Math.round(cardH * STD_ART_BOTTOM);
+        // No selection — use standard ratios + padding
+        artLeft   = Math.round(cardW * STD_ART_LEFT)  + PADDING;
+        artTop    = Math.round(cardH * STD_ART_TOP)   + PADDING;
+        artRight  = Math.round(cardW * STD_ART_RIGHT)  - PADDING;
+        artBottom = Math.round(cardH * STD_ART_BOTTOM) - PADDING;
     }
 
     var artBoxW = artRight - artLeft;

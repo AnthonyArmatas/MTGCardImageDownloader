@@ -427,14 +427,27 @@ def get_artswap_jsx_dir() -> Path:
         return Path(__file__).parent
 
 
-def run_jsx_in_photoshop(jsx_path: Path, on_log=None) -> bool:
+def run_jsx_in_photoshop(jsx_path: Path, on_log=None, var_overrides: dict | None = None) -> bool:
     """
     Run a JSX script file in Photoshop via PowerShell COM.
+    var_overrides: dict of JS variable name → value to prepend to the script.
     Returns True if it executed (Photoshop handles its own dialogs).
     """
     import subprocess as _sp
+    import tempfile
 
-    escaped = str(jsx_path).replace("'", "''")
+    jsx_content = jsx_path.read_text(encoding="utf-8")
+
+    # Prepend variable overrides so they shadow the defaults in the JSX
+    if var_overrides:
+        prefix_lines = [f"var {k} = {v};" for k, v in var_overrides.items()]
+        jsx_content = "\n".join(prefix_lines) + "\n" + jsx_content
+
+    # Write to temp file (PowerShell reads it via Get-Content)
+    tmp = Path(tempfile.gettempdir()) / "mtg_artswap_run.jsx"
+    tmp.write_text(jsx_content, encoding="utf-8")
+
+    escaped = str(tmp).replace("'", "''")
     ps_script = (
         f'$jsx = Get-Content -Path "{escaped}" -Raw; '
         '$ps = [System.Runtime.InteropServices.Marshal]::GetActiveObject("Photoshop.Application"); '
@@ -445,6 +458,8 @@ def run_jsx_in_photoshop(jsx_path: Path, on_log=None) -> bool:
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True, text=True, timeout=300,
         )
+        if tmp.exists():
+            tmp.unlink()
         if proc.returncode != 0 and proc.stderr.strip():
             if on_log:
                 on_log(f"❌ {proc.stderr.strip()}")
@@ -850,13 +865,71 @@ class MTGDeckImager(ctk.CTk):
             command=self._artswap_batch_export,
         ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
+        # ── Art Box Adjustments ───────────────────────────────────────────
+        ctk.CTkLabel(
+            tab, text="Art Box Adjustment  (% of card dimensions)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT_LIGHT,
+        ).pack(anchor="w", padx=8, pady=(12, 2))
+
+        ctk.CTkLabel(
+            tab,
+            text="Move sliders to control the art cutout. Ignored if you make a selection in PS first.",
+            font=ctk.CTkFont(size=11),
+            text_color="#667788",
+        ).pack(anchor="w", padx=8, pady=(0, 6))
+
+        def make_slider(parent, label_text, from_val, to_val, default, row):
+            ctk.CTkLabel(
+                parent, text=label_text, width=70,
+                font=ctk.CTkFont(size=12), text_color=TEXT_LIGHT,
+            ).grid(row=row, column=0, sticky="w", padx=(0, 4))
+
+            var = ctk.DoubleVar(value=default)
+            val_label = ctk.CTkLabel(
+                parent, text=f"{default:.1f}", width=44,
+                font=ctk.CTkFont(family="Consolas", size=12), text_color=ACCENT,
+            )
+            val_label.grid(row=row, column=2, padx=(4, 0))
+
+            def on_change(v, vl=val_label, va=var):
+                va.set(float(v))
+                vl.configure(text=f"{float(v):.1f}")
+
+            ctk.CTkSlider(
+                parent, from_=from_val, to=to_val,
+                number_of_steps=int((to_val - from_val) * 10),
+                variable=var,
+                fg_color="#0f1626", progress_color=ACCENT,
+                button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+                command=on_change,
+            ).grid(row=row, column=1, sticky="ew", padx=4)
+            return var
+
+        sliders = ctk.CTkFrame(tab, fg_color="transparent")
+        sliders.pack(fill="x", padx=8, pady=(0, 4))
+        sliders.grid_columnconfigure(1, weight=1)
+
+        self.artbox_left   = make_slider(sliders, "Left %",   2, 20,  8.4, 0)
+        self.artbox_top    = make_slider(sliders, "Top %",    5, 25, 12.5, 1)
+        self.artbox_right  = make_slider(sliders, "Right %",  80, 98, 91.6, 2)
+        self.artbox_bottom = make_slider(sliders, "Bottom %", 40, 70, 53.8, 3)
+        self.artbox_padding = make_slider(sliders, "Padding", 0, 20, 3.0, 4)
+
+        ctk.CTkButton(
+            tab, text="Reset to Defaults", width=140, height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color="#2a2a4a", hover_color="#3a3a5a",
+            command=self._artswap_reset_sliders,
+        ).pack(anchor="w", padx=8, pady=(2, 4))
+
         # ── Status ────────────────────────────────────────────────────────
         self.swap_status_label = ctk.CTkLabel(
             tab, text="Requires Photoshop to be running",
             font=ctk.CTkFont(size=11),
             text_color="#667788",
         )
-        self.swap_status_label.pack(anchor="w", padx=8, pady=(12, 8))
+        self.swap_status_label.pack(anchor="w", padx=8, pady=(8, 8))
 
     def _build_right_panel(self, parent):
         right = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12)
@@ -1229,6 +1302,23 @@ class MTGDeckImager(ctk.CTk):
 
     # ── Art Swap Logic (Photoshop Script Launchers) ─────────────────────
 
+    def _artswap_reset_sliders(self):
+        self.artbox_left.set(8.4)
+        self.artbox_top.set(12.5)
+        self.artbox_right.set(91.6)
+        self.artbox_bottom.set(53.8)
+        self.artbox_padding.set(3.0)
+
+    def _get_artbox_overrides(self) -> dict:
+        """Build JS variable overrides from the slider values."""
+        return {
+            "STD_ART_LEFT":   round(self.artbox_left.get() / 100, 4),
+            "STD_ART_TOP":    round(self.artbox_top.get() / 100, 4),
+            "STD_ART_RIGHT":  round(self.artbox_right.get() / 100, 4),
+            "STD_ART_BOTTOM": round(self.artbox_bottom.get() / 100, 4),
+            "PADDING":        int(self.artbox_padding.get()),
+        }
+
     def _artswap_run_jsx(self, script_name: str):
         jsx_dir = get_artswap_jsx_dir()
         jsx_path = jsx_dir / script_name
@@ -1236,12 +1326,24 @@ class MTGDeckImager(ctk.CTk):
             messagebox.showerror("Script not found", f"Cannot find {script_name}\nat {jsx_path}")
             return
 
+        overrides = self._get_artbox_overrides()
         self.swap_status_label.configure(text=f"Running {script_name}…", text_color=ACCENT)
         self._log(f"🎨 Running {script_name} in Photoshop…")
+        self._log(
+            f"   Art box: L={self.artbox_left.get():.1f}%"
+            f" T={self.artbox_top.get():.1f}%"
+            f" R={self.artbox_right.get():.1f}%"
+            f" B={self.artbox_bottom.get():.1f}%"
+            f" pad={int(self.artbox_padding.get())}px"
+        )
         self.tabview.set("Log")
 
         def worker():
-            ok = run_jsx_in_photoshop(jsx_path, on_log=lambda m: self.after(0, lambda msg=m: self._log(msg)))
+            ok = run_jsx_in_photoshop(
+                jsx_path,
+                on_log=lambda m: self.after(0, lambda msg=m: self._log(msg)),
+                var_overrides=overrides,
+            )
             if ok:
                 self.after(0, lambda: self._log(f"✅ {script_name} sent to Photoshop"))
                 self.after(0, lambda: self.swap_status_label.configure(

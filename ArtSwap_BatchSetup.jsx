@@ -18,10 +18,14 @@
 app.preferences.rulerUnits = Units.PIXELS;
 
 // Standard art box ratios (same as ArtSwap_Setup.jsx)
-var STD_ART_LEFT   = 0.065;
-var STD_ART_TOP    = 0.112;
-var STD_ART_RIGHT  = 0.935;
-var STD_ART_BOTTOM = 0.555;
+// ADJUST THESE if the cutout doesn't match your cards:
+var STD_ART_LEFT   = 0.084;
+var STD_ART_TOP    = 0.125;
+var STD_ART_RIGHT  = 0.916;
+var STD_ART_BOTTOM = 0.538;
+
+// Extra inward padding (pixels) — increase to cut less into the frame
+var PADDING = 3;
 
 var IMAGE_EXTENSIONS = /\.(png|jpg|jpeg|tif|tiff|bmp)$/i;
 
@@ -78,11 +82,11 @@ try {
         var cardW = doc.width.as("px");
         var cardH = doc.height.as("px");
 
-        // Calculate art box from standard ratios
-        var artLeft   = Math.round(cardW * STD_ART_LEFT);
-        var artTop    = Math.round(cardH * STD_ART_TOP);
-        var artRight  = Math.round(cardW * STD_ART_RIGHT);
-        var artBottom = Math.round(cardH * STD_ART_BOTTOM);
+        // Calculate art box from standard ratios + padding
+        var artLeft   = Math.round(cardW * STD_ART_LEFT)  + PADDING;
+        var artTop    = Math.round(cardH * STD_ART_TOP)   + PADDING;
+        var artRight  = Math.round(cardW * STD_ART_RIGHT)  - PADDING;
+        var artBottom = Math.round(cardH * STD_ART_BOTTOM) - PADDING;
         var artBoxW = artRight - artLeft;
         var artBoxH = artBottom - artTop;
 
